@@ -1,6 +1,7 @@
 package frameio
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -31,7 +32,10 @@ func NewClient(tokens *TokenStore, accountID string) *Client {
 	}
 }
 
-func (c *Client) do(ctx context.Context, method, path string, query url.Values, out any) (*http.Response, error) {
+// do performs an authenticated request. body is optional JSON-encodable
+// payload (pass nil for GET/DELETE); out is optional JSON-decodable target
+// for the response (pass nil to discard).
+func (c *Client) do(ctx context.Context, method, path string, query url.Values, body, out any) (*http.Response, error) {
 	access, err := c.Tokens.Valid(ctx, 60*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("frameio: token: %w", err)
@@ -40,13 +44,26 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
-	req, err := http.NewRequestWithContext(ctx, method, u, nil)
+
+	var reqBody io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("frameio: encode body: %w", err)
+		}
+		reqBody = bytes.NewReader(b)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, u, reqBody)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+access)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-api-version", "v4")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -59,8 +76,8 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	}
 	if resp.StatusCode >= 400 {
 		defer resp.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-		return resp, fmt.Errorf("frameio: %s %s → %s: %s", method, path, resp.Status, string(body))
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return resp, fmt.Errorf("frameio: %s %s → %s: %s", method, path, resp.Status, string(rb))
 	}
 	if out != nil {
 		defer resp.Body.Close()
@@ -83,7 +100,7 @@ func (c *Client) ListAccounts(ctx context.Context) ([]Account, error) {
 	var wrap struct {
 		Data []Account `json:"data"`
 	}
-	if _, err := c.do(ctx, "GET", "/accounts", nil, &wrap); err != nil {
+	if _, err := c.do(ctx, "GET", "/accounts", nil, nil, &wrap); err != nil {
 		return nil, err
 	}
 	return wrap.Data, nil
@@ -96,7 +113,7 @@ func (c *Client) ListWorkspaces(ctx context.Context, accountID string) ([]Worksp
 	var wrap struct {
 		Data []Workspace `json:"data"`
 	}
-	if _, err := c.do(ctx, "GET", "/accounts/"+accountID+"/workspaces", nil, &wrap); err != nil {
+	if _, err := c.do(ctx, "GET", "/accounts/"+accountID+"/workspaces", nil, nil, &wrap); err != nil {
 		return nil, err
 	}
 	return wrap.Data, nil
@@ -108,7 +125,7 @@ func (c *Client) ListProjects(ctx context.Context, accountID, workspaceID string
 	var wrap struct {
 		Data []Project `json:"data"`
 	}
-	if _, err := c.do(ctx, "GET", "/accounts/"+accountID+"/workspaces/"+workspaceID+"/projects", nil, &wrap); err != nil {
+	if _, err := c.do(ctx, "GET", "/accounts/"+accountID+"/workspaces/"+workspaceID+"/projects", nil, nil, &wrap); err != nil {
 		return nil, err
 	}
 	return wrap.Data, nil
@@ -123,7 +140,7 @@ func (c *Client) Me(ctx context.Context) (string, error) {
 			Email string `json:"email"`
 		} `json:"data"`
 	}
-	if _, err := c.do(ctx, "GET", "/me", nil, &me); err != nil {
+	if _, err := c.do(ctx, "GET", "/me", nil, nil, &me); err != nil {
 		return "", err
 	}
 	if me.Data.Name != "" {
@@ -149,7 +166,7 @@ func (c *Client) ListFolderChildren(ctx context.Context, folderID string) ([]Fil
 				NextCursor string `json:"next_cursor"`
 			} `json:"meta"`
 		}
-		_, err := c.do(ctx, "GET", c.accountPath("/folders/"+folderID+"/children"), q, &page)
+		_, err := c.do(ctx, "GET", c.accountPath("/folders/"+folderID+"/children"), q, nil, &page)
 		if err != nil {
 			return nil, err
 		}
@@ -171,7 +188,7 @@ func (c *Client) GetFile(ctx context.Context, fileID string) (File, error) {
 		Data File `json:"data"`
 	}
 	q := url.Values{"include": {"media_links.original"}}
-	if _, err := c.do(ctx, "GET", c.accountPath("/files/"+fileID), q, &wrap); err != nil {
+	if _, err := c.do(ctx, "GET", c.accountPath("/files/"+fileID), q, nil, &wrap); err != nil {
 		return File{}, err
 	}
 	return wrap.Data, nil
@@ -200,6 +217,6 @@ func (c *Client) Download(ctx context.Context, f File) (io.ReadCloser, int64, er
 
 // DeleteFile removes a file permanently.
 func (c *Client) DeleteFile(ctx context.Context, fileID string) error {
-	_, err := c.do(ctx, "DELETE", c.accountPath("/files/"+fileID), nil, nil)
+	_, err := c.do(ctx, "DELETE", c.accountPath("/files/"+fileID), nil, nil, nil)
 	return err
 }

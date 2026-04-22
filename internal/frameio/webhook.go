@@ -78,33 +78,12 @@ func ReadWebhookBody(r *http.Request, maxBytes int64) ([]byte, error) {
 // secret Frame.io will use for future deliveries. V4 scopes webhooks
 // per-workspace (not per-account).
 func (c *Client) RegisterWebhook(ctx context.Context, workspaceID, publicURL string, events []string) (secret, id string, err error) {
-	body, _ := json.Marshal(map[string]any{
+	body := map[string]any{
 		"data": map[string]any{
 			"url":    publicURL,
 			"events": events,
 			"name":   "frameio-immich-relay",
 		},
-	})
-	access, err := c.Tokens.Valid(ctx, 60*time.Second)
-	if err != nil {
-		return "", "", err
-	}
-	path := c.accountPath("/workspaces/" + workspaceID + "/webhooks")
-	req, err := http.NewRequestWithContext(ctx, "POST", c.Base+path, newBytesReader(body))
-	if err != nil {
-		return "", "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+access)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return "", "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-		return "", "", fmt.Errorf("frameio: register webhook: %s: %s", resp.Status, string(rb))
 	}
 	var wrap struct {
 		Data struct {
@@ -112,8 +91,9 @@ func (c *Client) RegisterWebhook(ctx context.Context, workspaceID, publicURL str
 			Secret string `json:"secret"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&wrap); err != nil {
-		return "", "", fmt.Errorf("frameio: decode webhook response: %w", err)
+	path := c.accountPath("/workspaces/" + workspaceID + "/webhooks")
+	if _, err := c.do(ctx, "POST", path, nil, body, &wrap); err != nil {
+		return "", "", err
 	}
 	return wrap.Data.Secret, wrap.Data.ID, nil
 }
@@ -122,6 +102,6 @@ func (c *Client) RegisterWebhook(ctx context.Context, workspaceID, publicURL str
 // is scoped to a workspace, but delete is scoped only to the account
 // (webhook_id alone identifies it).
 func (c *Client) DeleteWebhook(ctx context.Context, id string) error {
-	_, err := c.do(ctx, "DELETE", c.accountPath("/webhooks/"+id), nil, nil)
+	_, err := c.do(ctx, "DELETE", c.accountPath("/webhooks/"+id), nil, nil, nil)
 	return err
 }

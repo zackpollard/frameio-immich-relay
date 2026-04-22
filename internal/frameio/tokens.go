@@ -20,6 +20,10 @@ const (
 	IMSTokenURL     = "https://ims-na1.adobelogin.com/ims/token/v3"
 )
 
+// imsTokenURL is the actual endpoint used at runtime; tests override this
+// to point at an httptest.Server.
+var imsTokenURL = IMSTokenURL
+
 // TokenStore persists OAuth credentials + access/refresh tokens on disk and
 // auto-refreshes the access token when it's close to expiry.
 type TokenStore struct {
@@ -143,7 +147,7 @@ func (s *TokenStore) Valid(ctx context.Context, skew time.Duration) (string, err
 }
 
 func (s *TokenStore) tokenRequest(ctx context.Context, form url.Values) error {
-	req, err := http.NewRequestWithContext(ctx, "POST", IMSTokenURL, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", imsTokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
 	}

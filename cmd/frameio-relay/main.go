@@ -549,7 +549,9 @@ func (r *relay) runWebhookServer(ctx context.Context, addr, secret string) {
 	log.Printf("webhook server listening on %s (path /webhook)", addr)
 	go func() {
 		<-ctx.Done()
-		_ = srv.Close()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
 	}()
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Printf("webhook server: %v", err)
