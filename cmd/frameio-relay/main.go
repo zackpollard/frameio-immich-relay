@@ -45,12 +45,6 @@ func main() {
 	immichKey := flag.String("immich-key", os.Getenv("IMMICH_API_KEY"), "Immich API key (x-api-key header)")
 	flag.Parse()
 
-	if *accountID == "" {
-		log.Fatal("-account required")
-	}
-	if *folderID == "" {
-		log.Fatal("-folder required")
-	}
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		log.Fatalf("mkdir: %v", err)
 	}
@@ -77,6 +71,17 @@ func main() {
 		log.Fatalf("auth check: %v", err)
 	}
 	log.Printf("authenticated as %s", name)
+
+	if err := autoDiscover(ctx, client, accountID, workspaceID, folderID); err != nil {
+		log.Fatalf("auto-discover: %v", err)
+	}
+	if *accountID == "" {
+		log.Fatal("FRAMEIO_ACCOUNT required (discovery did not find one)")
+	}
+	if *folderID == "" {
+		log.Fatal("FRAMEIO_FOLDER required (discovery did not find one)")
+	}
+	client.AccountID = *accountID
 
 	var imm *immich.Client
 	if *immichURL != "" {
@@ -141,6 +146,59 @@ func main() {
 	r.runPollLoop(ctx, *pollInterval)
 
 	log.Printf("shutting down")
+}
+
+// autoDiscover fills in any of the account / workspace / folder IDs that
+// the user did not provide, so long as there is exactly one reasonable
+// choice at each level. Ambiguity (multiple accounts / workspaces /
+// projects) is a hard error with instructions to set the relevant var.
+func autoDiscover(ctx context.Context, client *frameio.Client, account, workspace, folder *string) error {
+	if *account == "" {
+		accounts, err := client.ListAccounts(ctx)
+		if err != nil {
+			return fmt.Errorf("list accounts: %w", err)
+		}
+		switch len(accounts) {
+		case 0:
+			return errors.New("no Frame.io accounts on this user; check your auth")
+		case 1:
+			*account = accounts[0].ID
+			log.Printf("discovered account: %q (%s)", accounts[0].DisplayName, *account)
+		default:
+			return fmt.Errorf("%d accounts present; set FRAMEIO_ACCOUNT explicitly (run `frameio-auth -discover` to list)", len(accounts))
+		}
+	}
+	if *workspace == "" {
+		workspaces, err := client.ListWorkspaces(ctx, *account)
+		if err != nil {
+			return fmt.Errorf("list workspaces: %w", err)
+		}
+		switch len(workspaces) {
+		case 0:
+			return fmt.Errorf("no workspaces in account %s", *account)
+		case 1:
+			*workspace = workspaces[0].ID
+			log.Printf("discovered workspace: %q (%s)", workspaces[0].Name, *workspace)
+		default:
+			return fmt.Errorf("%d workspaces in account; set FRAMEIO_WORKSPACE explicitly", len(workspaces))
+		}
+	}
+	if *folder == "" {
+		projects, err := client.ListProjects(ctx, *account, *workspace)
+		if err != nil {
+			return fmt.Errorf("list projects: %w", err)
+		}
+		switch len(projects) {
+		case 0:
+			return fmt.Errorf("no projects in workspace %s", *workspace)
+		case 1:
+			*folder = projects[0].RootFolderID
+			log.Printf("discovered project: %q root_folder_id=%s", projects[0].Name, *folder)
+		default:
+			return fmt.Errorf("%d projects in workspace; set FRAMEIO_FOLDER explicitly to a project's root_folder_id", len(projects))
+		}
+	}
+	return nil
 }
 
 // State --------------------------------------------------------------------

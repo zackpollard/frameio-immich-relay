@@ -118,12 +118,12 @@ Note the `https://<host>.<tailnet>.ts.net/` URL. The webhook path is `/webhook`,
 Clone the repo onto the deployment host, copy `.env.example` to `.env`, fill in:
 
 ```
-FRAMEIO_ACCOUNT=<account_id>
-FRAMEIO_WORKSPACE=<workspace_id>
-FRAMEIO_FOLDER=<root_folder_id>
 FRAMEIO_PUBLIC_URL=https://<host>.<tailnet>.ts.net/webhook
 IMMICH_URL=https://immich.example.com
 IMMICH_API_KEY=<key from step 4>
+# FRAMEIO_ACCOUNT / FRAMEIO_WORKSPACE / FRAMEIO_FOLDER can be omitted
+# if you have exactly one account + one workspace + one project;
+# the relay will auto-discover them at startup.
 ```
 
 Place `tokens.json` (from step 2) at `./data/tokens.json`. Then:
@@ -157,9 +157,9 @@ All configurable via env vars (suitable for Docker Compose) or CLI flags.
 
 | Variable | Flag | Required | Default | Description |
 |---|---|---|---|---|
-| `FRAMEIO_ACCOUNT` | `-account` | yes | | Frame.io V4 account UUID. |
-| `FRAMEIO_WORKSPACE` | `-workspace` | if public-url set | | Frame.io V4 workspace UUID. Webhooks are workspace-scoped. |
-| `FRAMEIO_FOLDER` | `-folder` | yes | | Project root folder UUID; reconcile walks this recursively. |
+| `FRAMEIO_ACCOUNT` | `-account` | auto | | Frame.io V4 account UUID. Auto-discovered at startup if exactly one account is on this user. |
+| `FRAMEIO_WORKSPACE` | `-workspace` | auto | | Frame.io V4 workspace UUID. Auto-discovered if exactly one workspace is in the account. |
+| `FRAMEIO_FOLDER` | `-folder` | auto | | Project root folder UUID; reconcile walks this recursively. Auto-discovered if exactly one project is in the workspace. |
 | `FRAMEIO_PUBLIC_URL` | `-public-url` | recommended | | Public HTTPS endpoint where Frame.io delivers webhooks (path must be `/webhook`). Omit to run in polling-only mode. |
 | `IMMICH_URL` | `-immich-url` | | | Immich base URL, e.g. `https://immich.example.com`. Empty disables Immich integration (files land only on local disk). |
 | `IMMICH_API_KEY` | `-immich-key` | if immich-url set | | Immich API key. |
