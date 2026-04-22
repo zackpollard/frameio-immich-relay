@@ -66,26 +66,30 @@ Open the URL it prints in your browser, grant access, click past the self-signed
 
 ### 3. Find the Frame.io IDs you'll need
 
-Once `tokens.json` exists, use the access token to discover your account / workspace / project root folder:
+`frameio-auth` prints the full Frame.io hierarchy (accounts → workspaces → projects) at the end of the first run. If you have exactly one of each, it also prints a ready-to-paste `.env` block:
+
+```
+Discovered Frame.io hierarchy:
+
+  Account: Zack's Account
+    id: 4668420c-6e47-43e1-969f-71c66e2aae07
+    Workspace: Zack's Workspace
+      id: 684071df-1816-4b7d-ae5e-d6fb455c8b8d
+      Project: Zack's First Project
+        id: 79ee151b-ce4f-4fe6-a00c-cfa59471e50f
+        root_folder_id: fe56bed4-ddd9-4dd0-81be-ca1c4e834df5
+
+Exactly one account / workspace / project — copy these into your .env:
+
+  FRAMEIO_ACCOUNT=4668420c-6e47-43e1-969f-71c66e2aae07
+  FRAMEIO_WORKSPACE=684071df-1816-4b7d-ae5e-d6fb455c8b8d
+  FRAMEIO_FOLDER=fe56bed4-ddd9-4dd0-81be-ca1c4e834df5
+```
+
+Re-run discovery any time (e.g. after creating a new project) without re-authenticating:
 
 ```sh
-ACCESS=$(jq -r .access_token data/tokens.json)
-
-curl -sS -H "Authorization: Bearer $ACCESS" https://api.frame.io/v4/accounts \
-  | jq '.data[] | {id, display_name}'
-# -> FRAMEIO_ACCOUNT
-
-ACCT=<account_id>
-curl -sS -H "Authorization: Bearer $ACCESS" \
-  "https://api.frame.io/v4/accounts/$ACCT/workspaces" \
-  | jq '.data[] | {id, name}'
-# -> FRAMEIO_WORKSPACE
-
-WS=<workspace_id>
-curl -sS -H "Authorization: Bearer $ACCESS" \
-  "https://api.frame.io/v4/accounts/$ACCT/workspaces/$WS/projects" \
-  | jq '.data[] | {id, name, root_folder_id}'
-# -> FRAMEIO_FOLDER is the root_folder_id of the project where C2C uploads land.
+./bin/frameio-auth -discover -tokens data/tokens.json
 ```
 
 ### 4. Generate an Immich API key

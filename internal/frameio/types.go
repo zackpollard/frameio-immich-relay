@@ -33,6 +33,26 @@ type MediaLink struct {
 // IsFile reports whether this is a terminal file (not a folder / stack).
 func (f File) IsFile() bool { return f.Type == "file" }
 
+// Account is a V4 account — the top of the hierarchy.
+type Account struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+}
+
+// Workspace lives inside an account and contains projects.
+type Workspace struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// Project lives inside a workspace and points to a root folder where C2C
+// uploads land.
+type Project struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	RootFolderID string `json:"root_folder_id"`
+}
+
 // IsReady reports whether the file's bytes are actually downloadable.
 // Observed progression on X-H2S C2C uploads:
 //   - "created"    metadata row exists, bytes still uploading (S3 → 403)

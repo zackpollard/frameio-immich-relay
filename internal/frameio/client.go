@@ -77,6 +77,43 @@ func (c *Client) accountPath(suffix string) string {
 	return "/accounts/" + c.AccountID + suffix
 }
 
+// ListAccounts returns every V4 account the authenticated user belongs to.
+// Works with Client.AccountID unset (discovery usage).
+func (c *Client) ListAccounts(ctx context.Context) ([]Account, error) {
+	var wrap struct {
+		Data []Account `json:"data"`
+	}
+	if _, err := c.do(ctx, "GET", "/accounts", nil, &wrap); err != nil {
+		return nil, err
+	}
+	return wrap.Data, nil
+}
+
+// ListWorkspaces returns workspaces in the given account. Takes an explicit
+// accountID (rather than using Client.AccountID) so discovery can iterate
+// every account the user has access to.
+func (c *Client) ListWorkspaces(ctx context.Context, accountID string) ([]Workspace, error) {
+	var wrap struct {
+		Data []Workspace `json:"data"`
+	}
+	if _, err := c.do(ctx, "GET", "/accounts/"+accountID+"/workspaces", nil, &wrap); err != nil {
+		return nil, err
+	}
+	return wrap.Data, nil
+}
+
+// ListProjects returns projects in the given workspace. Each project's
+// RootFolderID is the value you'd feed to the relay as -folder.
+func (c *Client) ListProjects(ctx context.Context, accountID, workspaceID string) ([]Project, error) {
+	var wrap struct {
+		Data []Project `json:"data"`
+	}
+	if _, err := c.do(ctx, "GET", "/accounts/"+accountID+"/workspaces/"+workspaceID+"/projects", nil, &wrap); err != nil {
+		return nil, err
+	}
+	return wrap.Data, nil
+}
+
 // Me returns the authenticated user's display info — used as a sanity check.
 func (c *Client) Me(ctx context.Context) (string, error) {
 	var me struct {
