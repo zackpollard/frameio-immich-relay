@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.3](https://github.com/zackpollard/frameio-immich-relay/compare/v0.1.2...v0.1.3) (2026-04-22)
+
+
+### Features
+
+* garbage-collect abandoned frame.io uploads ([c1e5e7c](https://github.com/zackpollard/frameio-immich-relay/commit/c1e5e7ca1ad39c8d07014cb9dfc507ab52a556a1))
+
+
+### Documentation
+
+* trim tunnel-specific setup instructions from README ([4883044](https://github.com/zackpollard/frameio-immich-relay/commit/48830448e33ae71a823e236b5e33b8a5f843aa04))
+
 ## [0.1.2](https://github.com/zackpollard/frameio-immich-relay/compare/v0.1.1...v0.1.2) (2026-04-22)
 
 
