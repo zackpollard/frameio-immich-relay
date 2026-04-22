@@ -39,7 +39,7 @@ Refresh tokens last months; access tokens are refreshed 60 seconds before expiry
 - A Frame.io account with a Camera-to-Cloud-enabled project. Free tier works.
 - A running Immich instance reachable over HTTPS.
 - Docker + Docker Compose on the host that'll run the relay.
-- A publicly-reachable HTTPS endpoint for webhook delivery. Recommended: [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) (free, no port forwarding, no TLS config). Alternatives: Cloudflare Tunnel, ngrok, or a real public IP + Caddy/Let's Encrypt.
+- **Optional:** a publicly-reachable HTTPS URL that routes to the relay's webhook port (`:9000` inside the container). Any tunnel or reverse-proxy setup works. Without this the relay runs in **polling-only mode** — every file is still processed, but with up to one poll interval (default 5 min) of latency per file instead of sub-second.
 - An Adobe Developer Console account (free) to register an OAuth app — Frame.io V4 doesn't support personal access tokens.
 
 ## Setup
@@ -101,26 +101,22 @@ In Immich web UI → **User Settings → API Keys → New API Key**. Select only
 
 Nothing else is required.
 
-### 5. Set up a public HTTPS endpoint
+### 5. (Optional) Expose the webhook receiver over HTTPS
 
-Easiest option, Tailscale Funnel:
+If you want Frame.io to deliver upload events over webhooks (sub-second latency), expose the relay's port 9000 over a public HTTPS URL. The method doesn't matter — Tailscale Funnel, Cloudflare Tunnel, ngrok, a real public IP with Caddy/Let's Encrypt, etc. The full `FRAMEIO_PUBLIC_URL` value is whatever URL you end up with, with `/webhook` appended.
 
-```sh
-sudo tailscale up            # one-time, if not already authenticated
-sudo tailscale funnel --bg 9000
-tailscale funnel status      # prints the public URL
-```
-
-Note the `https://<host>.<tailnet>.ts.net/` URL. The webhook path is `/webhook`, so the full value for `FRAMEIO_PUBLIC_URL` will be `https://<host>.<tailnet>.ts.net/webhook`.
+Skip this step entirely and the relay runs in **polling-only mode** — it still processes everything, just with up to one poll interval (default 5 min) of latency per file.
 
 ### 6. Configure and run
 
 Clone the repo onto the deployment host, copy `.env.example` to `.env`, fill in:
 
 ```
-FRAMEIO_PUBLIC_URL=https://<host>.<tailnet>.ts.net/webhook
 IMMICH_URL=https://immich.example.com
 IMMICH_API_KEY=<key from step 4>
+# Optional: set to enable webhook-driven (sub-second) delivery.
+# Omit to run in polling-only mode.
+FRAMEIO_PUBLIC_URL=https://<your-tunnel>/webhook
 # FRAMEIO_ACCOUNT / FRAMEIO_WORKSPACE / FRAMEIO_FOLDER can be omitted
 # if you have exactly one account + one workspace + one project;
 # the relay will auto-discover them at startup.
@@ -160,7 +156,7 @@ All configurable via env vars (suitable for Docker Compose) or CLI flags.
 | `FRAMEIO_ACCOUNT` | `-account` | auto | | Frame.io V4 account UUID. Auto-discovered at startup if exactly one account is on this user. |
 | `FRAMEIO_WORKSPACE` | `-workspace` | auto | | Frame.io V4 workspace UUID. Auto-discovered if exactly one workspace is in the account. |
 | `FRAMEIO_FOLDER` | `-folder` | auto | | Project root folder UUID; reconcile walks this recursively. Auto-discovered if exactly one project is in the workspace. |
-| `FRAMEIO_PUBLIC_URL` | `-public-url` | recommended | | Public HTTPS endpoint where Frame.io delivers webhooks (path must be `/webhook`). Omit to run in polling-only mode. |
+| `FRAMEIO_PUBLIC_URL` | `-public-url` | optional | | Public HTTPS URL routing to the relay's `:9000/webhook`. Enables webhook-driven sub-second delivery. Omit to run in polling-only mode (every file still processed, at up to one poll interval of latency). |
 | `IMMICH_URL` | `-immich-url` | | | Immich base URL, e.g. `https://immich.example.com`. Empty disables Immich integration (files land only on local disk). |
 | `IMMICH_API_KEY` | `-immich-key` | if immich-url set | | Immich API key. |
 | `FRAMEIO_STUCK_TIMEOUT` | `-stuck-timeout` | | `0` (disabled) | Delete non-ready Frame.io files older than this duration. Frame.io does not garbage-collect abandoned uploads, so stuck files eat your quota forever. Typical value: `6h`. |
@@ -211,7 +207,6 @@ make build
 ## Limitations
 
 - Depends on Frame.io's continued free tier for the transit relay. If Adobe changes storage quotas, delete-after-download keeps usage near zero as long as the relay is running.
-- Webhook delivery requires a public HTTPS endpoint. Polling-only mode works without it but adds up to one polling interval of latency per file.
 - Frame.io V4 personal accounts cannot use OAuth Server-to-Server; user-flow OAuth is the only option, which means one interactive browser login to bootstrap. Refresh tokens handle steady-state.
 - Immich's SHA-1 dedup is file-content based, so multiple Frame.io uploads of the same photo won't create duplicates in Immich. But a photo edited on-camera then re-uploaded will have different bytes and be ingested as a new asset.
 
