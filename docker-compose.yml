@@ -17,6 +17,11 @@ services:
       # When set, uploads to Immich and deletes the local copy on success.
       IMMICH_URL: ${IMMICH_URL:-}
       IMMICH_API_KEY: ${IMMICH_API_KEY:-}
+      # Optional: garbage-collect files stuck in a non-ready status on
+      # Frame.io (failed/abandoned uploads) older than this duration.
+      # Frame.io does not auto-clean these; leaving it unset means they
+      # accumulate in your storage quota. Format: "1h", "6h", "24h".
+      FRAMEIO_STUCK_TIMEOUT: ${FRAMEIO_STUCK_TIMEOUT:-}
     volumes:
       # Persistent state. tokens.json MUST exist here before first start
       # — generate it on your workstation with ./bin/frameio-auth and

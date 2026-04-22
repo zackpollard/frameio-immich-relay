@@ -40,6 +40,7 @@ func main() {
 	outDir := flag.String("out", "downloads", "local directory for downloaded files")
 	stateFile := flag.String("state", "relay-state.json", "local state file tracking processed file IDs + webhook secret")
 	pollInterval := flag.Duration("poll", 60*time.Second, "reconcile polling interval (backup for missed webhooks)")
+	stuckTimeout := flag.Duration("stuck-timeout", envDuration("FRAMEIO_STUCK_TIMEOUT", 0), "delete non-ready Frame.io files older than this (0 = never). Frame.io does not auto-clean abandoned uploads; a stuck file eats your quota forever.")
 	dryRun := flag.Bool("dry-run", false, "download but do not delete from Frame.io or Immich-upload")
 	immichURL := flag.String("immich-url", os.Getenv("IMMICH_URL"), "Immich base URL, e.g. https://immich.example.com; empty disables Immich integration")
 	immichKey := flag.String("immich-key", os.Getenv("IMMICH_API_KEY"), "Immich API key (x-api-key header)")
@@ -95,14 +96,15 @@ func main() {
 	}
 
 	r := &relay{
-		client:    client,
-		immich:    imm,
-		folderID:  *folderID,
-		outDir:    *outDir,
-		stateFile: *stateFile,
-		state:     st,
-		dryRun:    *dryRun,
-		inflight:  map[string]struct{}{},
+		client:       client,
+		immich:       imm,
+		folderID:     *folderID,
+		outDir:       *outDir,
+		stateFile:    *stateFile,
+		state:        st,
+		dryRun:       *dryRun,
+		stuckTimeout: *stuckTimeout,
+		inflight:     map[string]struct{}{},
 	}
 
 	// Register webhook if we have a public URL and don't already have one.
@@ -244,13 +246,14 @@ func saveState(path string, s *state) error {
 // Relay --------------------------------------------------------------------
 
 type relay struct {
-	client    *frameio.Client
-	immich    *immich.Client // nil => skip Immich integration
-	folderID  string
-	outDir    string
-	stateFile string
-	state     *state
-	dryRun    bool
+	client       *frameio.Client
+	immich       *immich.Client // nil => skip Immich integration
+	folderID     string
+	outDir       string
+	stateFile    string
+	state        *state
+	dryRun       bool
+	stuckTimeout time.Duration // 0 = never clean up stuck uploads
 
 	mu       sync.Mutex
 	inflight map[string]struct{} // asset IDs currently being processed
@@ -365,14 +368,41 @@ func (r *relay) reconcile(ctx context.Context) error {
 		return err
 	}
 	for _, f := range files {
-		if !f.IsReady() {
+		if f.IsReady() {
+			if err := r.process(ctx, f); err != nil {
+				log.Printf("[%s] reconcile process: %v", f.ID, err)
+			}
 			continue
 		}
-		if err := r.process(ctx, f); err != nil {
-			log.Printf("[%s] reconcile process: %v", f.ID, err)
+		if err := r.maybeReapStuck(ctx, f); err != nil {
+			log.Printf("[%s] reap stuck: %v", f.ID, err)
 		}
 	}
 	return nil
+}
+
+// maybeReapStuck deletes a non-ready file if it's been stuck longer than
+// r.stuckTimeout. No-op when stuckTimeout is 0 or the file has no
+// CreatedAt. Frame.io doesn't auto-clean abandoned uploads, so without
+// this they'd accumulate in the user's storage quota forever.
+func (r *relay) maybeReapStuck(ctx context.Context, f frameio.File) error {
+	if r.stuckTimeout <= 0 || r.dryRun {
+		return nil
+	}
+	if f.CreatedAt.IsZero() {
+		return nil
+	}
+	age := time.Since(f.CreatedAt)
+	if age < r.stuckTimeout {
+		return nil
+	}
+	if !r.claim(f.ID) {
+		return nil
+	}
+	defer r.release(f.ID)
+
+	log.Printf("[%s] %s stuck in status=%q for %s (> %s); deleting", f.ID, f.Name, f.Status, age.Round(time.Second), r.stuckTimeout)
+	return r.client.DeleteFile(ctx, f.ID)
 }
 
 func (r *relay) walk(ctx context.Context, rootID string) ([]frameio.File, error) {
@@ -559,6 +589,21 @@ func (r *relay) runWebhookServer(ctx context.Context, addr, secret string) {
 }
 
 // Helpers ------------------------------------------------------------------
+
+// envDuration parses an env var as a duration, returning fallback on empty
+// or unparseable input. Used so stuck-timeout can also be set via the
+// FRAMEIO_STUCK_TIMEOUT env var (friendlier for Docker Compose).
+func envDuration(key string, fallback time.Duration) time.Duration {
+	s := os.Getenv(key)
+	if s == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return fallback
+	}
+	return d
+}
 
 func writeAndClose(path string, body io.ReadCloser) (int64, error) {
 	defer body.Close()

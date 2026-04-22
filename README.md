@@ -163,6 +163,7 @@ All configurable via env vars (suitable for Docker Compose) or CLI flags.
 | `FRAMEIO_PUBLIC_URL` | `-public-url` | recommended | | Public HTTPS endpoint where Frame.io delivers webhooks (path must be `/webhook`). Omit to run in polling-only mode. |
 | `IMMICH_URL` | `-immich-url` | | | Immich base URL, e.g. `https://immich.example.com`. Empty disables Immich integration (files land only on local disk). |
 | `IMMICH_API_KEY` | `-immich-key` | if immich-url set | | Immich API key. |
+| `FRAMEIO_STUCK_TIMEOUT` | `-stuck-timeout` | | `0` (disabled) | Delete non-ready Frame.io files older than this duration. Frame.io does not garbage-collect abandoned uploads, so stuck files eat your quota forever. Typical value: `6h`. |
 | | `-tokens` | | `tokens.json` | Path to tokens file from `frameio-auth`. |
 | | `-state` | | `relay-state.json` | Local state (webhook registration data). |
 | | `-out` | | `downloads` | Temporary local buffer for downloaded files. |
@@ -192,7 +193,7 @@ make build
 
 **Webhook fires but signature verification fails.** Check for stale webhooks on your Frame.io workspace — if you've run the relay multiple times with different state files, you may have duplicate registrations with different secrets. List them: `curl -H "Authorization: Bearer $ACCESS" https://api.frame.io/v4/accounts/$ACCT/workspaces/$WS/webhooks`, delete stale ones via `DELETE /v4/accounts/$ACCT/webhooks/$ID`.
 
-**Files on Frame.io stuck with `status: created`.** Bytes haven't finished uploading, or the upload from camera failed. The relay deliberately skips these until they transition to `uploaded` / `transcoded`. If one is stuck for hours, delete it manually from the Frame.io web UI.
+**Files on Frame.io stuck with `status: created`.** Bytes haven't finished uploading, or the upload from camera failed. Frame.io doesn't auto-clean these and they'll eat your storage quota indefinitely. Set `FRAMEIO_STUCK_TIMEOUT=6h` (or whatever grace period is longer than your slowest realistic upload) and the relay will delete any file stuck in a non-ready state past that age during its reconcile pass.
 
 **`403 AccessDenied` on file download.** The file's pre-signed S3 URL was issued but the bytes aren't on S3 yet. Happens if you treat `status: created` as downloadable. The relay handles this by only accepting `uploaded`/`transcoded`/equivalent statuses.
 
