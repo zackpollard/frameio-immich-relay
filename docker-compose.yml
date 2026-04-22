@@ -1,0 +1,35 @@
+services:
+  frameio-relay:
+    build: .
+    image: frameio-relay:latest
+    container_name: frameio-relay
+    restart: unless-stopped
+    # Bind port 9000 only to localhost — the public entrypoint is
+    # whatever Tailscale Funnel (or other tunnel) lives on.
+    ports:
+      - "127.0.0.1:9000:9000"
+    environment:
+      FRAMEIO_ACCOUNT: ${FRAMEIO_ACCOUNT:?set FRAMEIO_ACCOUNT in .env}
+      FRAMEIO_WORKSPACE: ${FRAMEIO_WORKSPACE:?set FRAMEIO_WORKSPACE in .env}
+      FRAMEIO_FOLDER: ${FRAMEIO_FOLDER:?set FRAMEIO_FOLDER in .env}
+      FRAMEIO_PUBLIC_URL: ${FRAMEIO_PUBLIC_URL:?set FRAMEIO_PUBLIC_URL in .env}
+      # Optional: empty = Frame.io → local disk → delete-from-Frame.io only.
+      # When set, uploads to Immich and deletes the local copy on success.
+      IMMICH_URL: ${IMMICH_URL:-}
+      IMMICH_API_KEY: ${IMMICH_API_KEY:-}
+    volumes:
+      # Persistent state. tokens.json MUST exist here before first start
+      # — generate it on your workstation with ./bin/frameio-auth and
+      # copy into ./data/tokens.json.
+      - ./data:/data
+      # Where downloaded files land. Point this anywhere you want.
+      - ./downloads:/downloads
+    # Run as host uid/gid so bind-mounted ./data and ./downloads are
+    # writable without chown dances. Change to match your own uid:gid.
+    user: "1000:1000"
+    healthcheck:
+      # the webhook endpoint always replies even to GET, so a simple
+      # connectivity probe via wget is enough. Distroless has no shell
+      # or wget, so use the container's own status via TCP-level check
+      # from an external sidecar if you want strict healthchecks.
+      disable: true

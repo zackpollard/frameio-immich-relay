@@ -1,0 +1,14 @@
+bin/
+captures/
+certs/
+downloads/
+pcaps/
+tokens.json
+tokens.json.tmp
+relay-state.json
+relay-state.json.tmp
+*.md
+.git/
+.gitignore
+.claude/
+Makefile

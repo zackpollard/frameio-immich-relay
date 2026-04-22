@@ -1,0 +1,19 @@
+/bin/
+
+# Secrets — never commit
+.env
+tokens.json
+tokens.json.tmp
+data/tokens.json
+data/tokens.json.tmp
+relay-state.json
+relay-state.json.tmp
+data/relay-state.json
+data/relay-state.json.tmp
+
+# Generated / local-only
+/certs/
+/captures/
+/pcaps/
+/downloads/
+/data/
