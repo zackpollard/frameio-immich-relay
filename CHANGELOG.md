@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/zackpollard/frameio-immich-relay/compare/v0.1.1...v0.1.2) (2026-04-22)
+
+
+### Code Refactoring
+
+* unify Client.do to accept optional JSON body, rewrite ([d5a874d](https://github.com/zackpollard/frameio-immich-relay/commit/d5a874d64ca0442441a0bf64eb5141beab99dc7c))
+
 ## [0.1.1](https://github.com/zackpollard/frameio-immich-relay/compare/v0.1.0...v0.1.1) (2026-04-22)
 
 
