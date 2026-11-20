@@ -61,8 +61,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("load tokens: %v", err)
 	}
-	if tokens.ClientID == "" || tokens.RefreshToken == "" {
-		log.Fatalf("tokens file %s is incomplete — run frameio-auth first", *tokensPath)
+	// Client credentials may come from the environment instead of tokens.json
+	// — that is how a fresh host bootstraps through the /admin panel.
+	if tokens.ClientID == "" {
+		tokens.ClientID = os.Getenv("FRAMEIO_CLIENT_ID")
+	}
+	if tokens.ClientSecret == "" {
+		tokens.ClientSecret = os.Getenv("FRAMEIO_CLIENT_SECRET")
+	}
+	bootstrapping := tokens.RefreshToken == ""
+	if bootstrapping && *adminPassword == "" {
+		log.Fatalf("tokens file %s has no refresh token — run frameio-auth first, or set ADMIN_PASSWORD (+ FRAMEIO_CLIENT_ID/FRAMEIO_CLIENT_SECRET) to bootstrap via the /admin panel", *tokensPath)
 	}
 	client := frameio.NewClient(tokens, *accountID)
 
@@ -73,23 +82,6 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-
-	name, err := client.Me(ctx)
-	if err != nil {
-		log.Fatalf("auth check: %v", err)
-	}
-	log.Printf("authenticated as %s", name)
-
-	if err := autoDiscover(ctx, client, accountID, workspaceID, folderID); err != nil {
-		log.Fatalf("auto-discover: %v", err)
-	}
-	if *accountID == "" {
-		log.Fatal("FRAMEIO_ACCOUNT required (discovery did not find one)")
-	}
-	if *folderID == "" {
-		log.Fatal("FRAMEIO_FOLDER required (discovery did not find one)")
-	}
-	client.AccountID = *accountID
 
 	var imm *immich.Client
 	if *immichURL != "" {
@@ -103,50 +95,37 @@ func main() {
 	}
 
 	r := &relay{
-		client:       client,
-		tokens:       tokens,
-		immich:       imm,
-		folderID:     *folderID,
-		outDir:       *outDir,
-		stateFile:    *stateFile,
-		state:        st,
-		dryRun:       *dryRun,
-		stuckTimeout: *stuckTimeout,
-		publicURL:    *publicURL,
-		pollInterval: *pollInterval,
-		account:      *accountID,
-		workspace:    *workspaceID,
-		immichURL:    *immichURL,
-		authName:     name,
-		startedAt:    time.Now(),
-		inflight:     map[string]struct{}{},
-		whSecret:     st.WebhookSecret,
-		events:       newEventLog(200),
+		client:        client,
+		tokens:        tokens,
+		immich:        imm,
+		folderID:      *folderID,
+		outDir:        *outDir,
+		stateFile:     *stateFile,
+		state:         st,
+		dryRun:        *dryRun,
+		stuckTimeout:  *stuckTimeout,
+		publicURL:     *publicURL,
+		pollInterval:  *pollInterval,
+		account:       *accountID,
+		workspace:     *workspaceID,
+		immichURL:     *immichURL,
+		startedAt:     time.Now(),
+		inflight:      map[string]struct{}{},
+		whSecret:      st.WebhookSecret,
+		events:        newEventLog(200),
+		sigCtx:        ctx,
+		accountFlag:   accountID,
+		workspaceFlag: workspaceID,
+		folderFlag:    folderID,
 	}
-	r.eventf("authenticated as %s", name)
 
-	// Register webhook if we have a public URL and don't already have one.
-	if *publicURL != "" {
-		if *workspaceID == "" {
-			log.Fatalf("-workspace is required when -public-url is set (webhooks are workspace-scoped)")
-		}
-		if st.WebhookID == "" {
-			secret, id, err := client.RegisterWebhook(ctx, *workspaceID, *publicURL, []string{"file.upload.completed"})
-			if err != nil {
-				log.Fatalf("register webhook: %v", err)
-			}
-			st.WebhookID = id
-			st.WebhookSecret = secret
-			st.WebhookWorkspace = *workspaceID
-			if err := saveState(*stateFile, st); err != nil {
-				log.Fatalf("save state after webhook register: %v", err)
-			}
-			r.eventf("registered webhook %s → %s", id, *publicURL)
-		} else {
-			r.eventf("reusing existing webhook %s (secret cached in state)", st.WebhookID)
-		}
+	if bootstrapping {
+		log.Printf("no refresh token in %s — bootstrap mode: serving the admin panel only; finish the Frame.io login at /admin to go live", *tokensPath)
+		r.eventf("bootstrap mode: no refresh token in %s; complete the browser login in the admin panel to go live", *tokensPath)
 	} else {
-		r.eventf("no -public-url set — running in polling-only mode")
+		if err := r.goLive(ctx); err != nil {
+			log.Fatalf("startup: %v", err)
+		}
 	}
 
 	// HTTP server on the webhook port: /webhook for Frame.io deliveries,
@@ -172,17 +151,7 @@ func main() {
 	}
 	go r.runHTTPServer(ctx, *webhookAddr, adm)
 
-	// Startup sweep of any local files (orphans from a crashed Immich
-	// upload, or from before Immich was enabled). No-op when Immich is
-	// disabled. Must run before the poll loop so uploads don't race with
-	// Frame.io-initiated processing of the same file.
-	if err := r.reconcileLocal(ctx); err != nil {
-		log.Printf("local reconcile: %v", err)
-	}
-
-	// Reconcile polling loop — catches anything missed by the webhook path.
-	r.runPollLoop(ctx, *pollInterval)
-
+	<-ctx.Done()
 	log.Printf("shutting down")
 }
 
@@ -308,6 +277,16 @@ type relay struct {
 	whSecret string // live webhook signing secret (admin can re-register)
 
 	events *eventLog // ring buffer shown on the admin dashboard
+
+	// Bootstrap mode support: when tokens.json has no refresh token yet,
+	// the relay serves only the admin panel and calls goLive after the
+	// browser OAuth flow saves tokens.
+	sigCtx        context.Context
+	accountFlag   *string
+	workspaceFlag *string
+	folderFlag    *string
+	liveMu        sync.Mutex
+	live          bool
 }
 
 func (r *relay) runPollLoop(ctx context.Context, interval time.Duration) {
@@ -729,6 +708,92 @@ func (r *relay) eventf(format string, args ...any) {
 	r.events.add(msg)
 }
 
+// goLive runs the authenticated startup sequence: verify auth, auto-discover
+// account/workspace/folder, register the webhook, sweep local files, and
+// start the poll loop. Called once from main on a normal start, or once from
+// the admin OAuth callback in bootstrap mode. On failure in bootstrap mode
+// the live flag is reset so a later re-auth can retry.
+func (r *relay) goLive(ctx context.Context) error {
+	r.liveMu.Lock()
+	if r.live {
+		r.liveMu.Unlock()
+		return nil
+	}
+	r.live = true
+	r.liveMu.Unlock()
+	fail := func(err error) error {
+		r.liveMu.Lock()
+		r.live = false
+		r.liveMu.Unlock()
+		return err
+	}
+
+	name, err := r.client.Me(ctx)
+	if err != nil {
+		return fail(fmt.Errorf("auth check: %w", err))
+	}
+	r.authName = name
+	r.eventf("authenticated as %s", name)
+
+	if err := autoDiscover(ctx, r.client, r.accountFlag, r.workspaceFlag, r.folderFlag); err != nil {
+		return fail(fmt.Errorf("auto-discover: %w", err))
+	}
+	if *r.accountFlag == "" {
+		return fail(errors.New("FRAMEIO_ACCOUNT required (discovery did not find one)"))
+	}
+	if *r.folderFlag == "" {
+		return fail(errors.New("FRAMEIO_FOLDER required (discovery did not find one)"))
+	}
+	r.client.AccountID = *r.accountFlag
+	r.account = *r.accountFlag
+	r.workspace = *r.workspaceFlag
+	r.folderID = *r.folderFlag
+
+	if err := r.ensureWebhook(ctx); err != nil {
+		return fail(err)
+	}
+
+	// Startup sweep of local files, then the reconcile poll loop (both in
+	// the background — main blocks on the signal context).
+	if err := r.reconcileLocal(ctx); err != nil {
+		r.eventf("local reconcile: %v", err)
+	}
+	go r.runPollLoop(r.sigCtx, r.pollInterval)
+	r.eventf("relay live: polling every %s, folder %s", r.pollInterval, r.folderID)
+	return nil
+}
+
+// ensureWebhook registers the Frame.io webhook if a public URL is configured
+// and no webhook is registered yet; otherwise reuses the cached one.
+func (r *relay) ensureWebhook(ctx context.Context) error {
+	if r.publicURL == "" {
+		r.eventf("no -public-url set — running in polling-only mode")
+		return nil
+	}
+	if r.workspace == "" {
+		return errors.New("FRAMEIO_WORKSPACE required when FRAMEIO_PUBLIC_URL is set (webhooks are workspace-scoped)")
+	}
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	if r.state.WebhookID != "" {
+		r.eventf("reusing existing webhook %s (secret cached in state)", r.state.WebhookID)
+		return nil
+	}
+	secret, id, err := r.client.RegisterWebhook(ctx, r.workspace, r.publicURL, []string{"file.upload.completed"})
+	if err != nil {
+		return fmt.Errorf("register webhook: %w", err)
+	}
+	r.state.WebhookID = id
+	r.state.WebhookSecret = secret
+	r.state.WebhookWorkspace = r.workspace
+	if err := saveState(r.stateFile, r.state); err != nil {
+		return fmt.Errorf("save state after webhook register: %w", err)
+	}
+	r.setSecret(secret)
+	r.eventf("registered webhook %s → %s", id, r.publicURL)
+	return nil
+}
+
 // Admin backend ---------------------------------------------------------------
 
 func (r *relay) inflightCount() int {
@@ -966,6 +1031,13 @@ func (b *relayBackend) ExchangeOAuthCode(ctx context.Context, code, redirectURI 
 		return err
 	}
 	r.eventf("browser OAuth exchange complete; tokens saved to %s", r.tokens.Path)
+	// In bootstrap mode (no tokens at startup) this is the moment the relay
+	// goes live: auth check, discovery, webhook registration, poll loop.
+	liveCtx, cancel := context.WithTimeout(r.sigCtx, 2*time.Minute)
+	defer cancel()
+	if err := r.goLive(liveCtx); err != nil {
+		r.eventf("go-live after browser auth failed: %v — fix the config and re-run Re-authenticate", err)
+	}
 	return nil
 }
 

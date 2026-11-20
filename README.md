@@ -168,6 +168,8 @@ All configurable via env vars (suitable for Docker Compose) or CLI flags.
 | | `-dry-run` | | `false` | Download but don't delete from Frame.io or upload to Immich. |
 | `ADMIN_PASSWORD` | `-admin-password` | optional | empty (disabled) | Enables the login-protected admin panel at `/admin` on the webhook port. Generate with `openssl rand -hex 24`. |
 | `ADMIN_SESSION_TTL` | `-admin-session-ttl` | | `12h` | Admin panel session lifetime. |
+| `FRAMEIO_CLIENT_ID` | | bootstrap only | | Adobe Developer Console OAuth client ID. Used when `tokens.json` has none, so a fresh host can complete the browser login via the admin panel. |
+| `FRAMEIO_CLIENT_SECRET` | | bootstrap only | | Adobe Developer Console OAuth client secret. Same as above. |
 
 ## Admin panel
 
@@ -184,6 +186,10 @@ The panel shows live relay state and lets you:
 - Inspect `/admin/state` — relay state JSON with the webhook secret masked.
 
 Security properties: the panel is fully disabled when `ADMIN_PASSWORD` is unset. Login is throttled (10 failures / 5 min per IP), the password is checked as a salted SHA-256 with a constant-time compare, sessions are random 256-bit IDs with a TTL (cookie is HttpOnly, SameSite=Lax so the OAuth redirect works, Secure over HTTPS), every state-changing POST requires a per-session CSRF token, and no secret (tokens, webhook secret, API keys) is ever rendered. `/webhook` remains HMAC-verified and independent of the panel. Keep the port bound to localhost and only expose it through your authenticated tunnel.
+
+### Bootstrapping a fresh host (no tokens.json needed)
+
+With the admin panel enabled you do **not** have to copy `tokens.json` to a new host. Set `ADMIN_PASSWORD`, `FRAMEIO_CLIENT_ID` and `FRAMEIO_CLIENT_SECRET` (both from the Adobe Developer Console project), and `FRAMEIO_PUBLIC_URL`; start the container with an empty (or missing) `data/tokens.json`. The relay starts in **bootstrap mode**: it serves only the admin panel (the poll loop and webhook stay off until auth works). Open `https://<public-host>/admin`, sign in, click **Re-authenticate with Frame.io…**, grant access in the browser — the relay exchanges the code, atomically writes `data/tokens.json`, verifies auth, auto-discovers account/workspace/folder if unset, registers the webhook, and starts polling. All visible in the dashboard's activity feed.
 
 ## Running outside Docker
 
