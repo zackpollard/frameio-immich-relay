@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/zackpollard/frameio-immich-relay/compare/v0.1.3...v0.1.4) (2026-11-20)
+
+
+### Features
+
+* login-protected admin panel at /admin with browser OAuth re-auth ([#4](https://github.com/zackpollard/frameio-immich-relay/issues/4)) ([5bb8f98](https://github.com/zackpollard/frameio-immich-relay/commit/5bb8f98462e85c5c5168cd57dfa74f89ba9b14eb))
+
 ## [0.1.3](https://github.com/zackpollard/frameio-immich-relay/compare/v0.1.2...v0.1.3) (2026-04-22)
 
 
