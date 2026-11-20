@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} — frameio-relay admin</title>
+<style>{{template "css" .}}</style>
+</head>
+<body>
+<header class="top">
+  <span class="brand">frameio-relay admin</span>
+  <span class="ver">v{{.Status.Version}}</span>
+  <span class="badge muted">uptime {{.Status.Uptime}}</span>
+  <span class="spacer"></span>
+  <form class="inline" method="post" action="/admin/logout">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button type="submit">Sign out</button>
+  </form>
+</header>
+
+<div class="wrap">
+  {{if .Flash}}<div class="flash {{.Flash}}">{{.FlashMsg}}</div>{{end}}
+
+  <div class="grid">
+    <div class="card">
+      <h2>Authentication</h2>
+      <table class="kv">
+        <tr><td>frame.io user</td><td>{{if .Status.AuthName}}{{.Status.AuthName}}{{else}}<span class="badge err">not verified</span>{{end}}</td></tr>
+        <tr><td>access token expiry</td><td>{{if .Status.TokenExpiry.IsZero}}—{{else}}{{.Status.TokenExpiry.UTC.Format "2006-01-02 15:04:05 UTC"}}{{end}}</td></tr>
+        <tr><td>refresh token</td><td>{{if .Status.HasRefresh}}<span class="badge ok">stored</span>{{else}}<span class="badge err">missing</span>{{end}}</td></tr>
+        <tr><td>tokens file</td><td>{{.Status.TokensPath}}</td></tr>
+        <tr><td>browser re-auth</td><td>{{if .Status.OAuthAvailable}}<span class="badge ok">available</span>{{else}}<span class="badge muted">needs FRAMEIO_PUBLIC_URL + client creds</span>{{end}}</td></tr>
+      </table>
+      <div class="actions">
+        <form class="inline" method="post" action="/admin/auth/check">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <button type="submit">Verify auth now</button>
+        </form>
+        <form class="inline" method="post" action="/admin/tokens/reload">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <button type="submit">Reload tokens from disk</button>
+        </form>
+        <form class="inline" method="post" action="/admin/oauth/start">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <button type="submit" class="primary" {{if not .Status.OAuthAvailable}}disabled{{end}}>Re-authenticate with Frame.io…</button>
+        </form>
+      </div>
+      {{if not .Status.OAuthAvailable}}<div class="hint">Browser re-auth redirects through Adobe IMS to <code>{{if .Status.AdminURL}}{{.Status.AdminURL}}/oauth/callback{{else}}(needs public URL){{end}}</code> — add that as a redirect URI in the Adobe Developer Console project.</div>{{end}}
+    </div>
+
+    <div class="card">
+      <h2>Configuration</h2>
+      <table class="kv">
+        <tr><td>account</td><td>{{.Status.Account}}</td></tr>
+        <tr><td>workspace</td><td>{{.Status.Workspace}}</td></tr>
+        <tr><td>folder</td><td>{{.Status.Folder}}</td></tr>
+        <tr><td>webhook public URL</td><td>{{if .Status.PublicURL}}{{.Status.PublicURL}}{{else}}<span class="badge muted">polling-only</span>{{end}}</td></tr>
+        <tr><td>admin URL</td><td>{{if .Status.AdminURL}}{{.Status.AdminURL}}{{else}}(LAN only — no public URL){{end}}</td></tr>
+        <tr><td>immich</td><td>{{if .Status.ImmichURL}}{{.Status.ImmichURL}}{{else}}<span class="badge muted">disabled</span>{{end}}</td></tr>
+        <tr><td>poll interval</td><td>{{.Status.PollInterval}}</td></tr>
+        <tr><td>stuck timeout</td><td>{{if .Status.StuckTimeout}}{{.Status.StuckTimeout}}{{else}}disabled{{end}}</td></tr>
+        <tr><td>dry run</td><td>{{.Status.DryRun}}</td></tr>
+        <tr><td>downloads dir</td><td>{{.Status.OutDir}}</td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Webhook</h2>
+      <table class="kv">
+        <tr><td>registered id</td><td>{{if .Status.WebhookID}}{{.Status.WebhookID}}{{else}}<span class="badge muted">none</span>{{end}}</td></tr>
+        <tr><td>target</td><td>{{if .Status.WebhookTarget}}{{.Status.WebhookTarget}}{{else}}—{{end}}</td></tr>
+        <tr><td>state file</td><td>{{.Status.StateFile}}</td></tr>
+      </table>
+      {{if .Webhooks}}
+      <div class="hint" style="margin:10px 0 4px">All webhooks on this workspace:</div>
+      <table class="kv">
+        {{range .Webhooks}}<tr><td>{{.ID}}</td><td>{{.URL}}</td></tr>{{end}}
+      </table>
+      {{else if .WebhookErr}}<div class="err-text">{{.WebhookErr}}</div>{{end}}
+      <div class="actions">
+        <form class="inline" method="post" action="/admin/webhook/register">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <button type="submit" {{if .Status.PollingOnly}}disabled{{end}}>Re-register webhook</button>
+        </form>
+        <form class="inline" method="post" action="/admin/webhook/delete">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <button type="submit" {{if not .Status.WebhookID}}disabled{{end}}>Delete webhook</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Relay</h2>
+      <div class="stats">
+        <div><div class="num" id="stat-inflight">{{.Status.Inflight}}</div><div class="lbl">in flight</div></div>
+        <div><div class="num" id="stat-files">{{.Downloads.Files}}</div><div class="lbl">files on disk</div></div>
+        <div><div class="num" id="stat-bytes">{{.Downloads.Bytes}}</div><div class="lbl">bytes on disk</div></div>
+      </div>
+      <div class="actions">
+        <form class="inline" method="post" action="/admin/reconcile">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <button type="submit">Run reconcile now</button>
+        </form>
+        <form class="inline" method="post" action="/admin/reap-stuck">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <button type="submit" {{if not .Status.StuckTimeout}}disabled{{end}}>GC stuck uploads now</button>
+        </form>
+      </div>
+      <div class="hint">State JSON (secrets masked): <a href="/admin/state">/admin/state</a></div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / -1;">
+      <h2>Recent activity <span class="hint">(auto-refreshes)</span></h2>
+      <ul id="events">
+        {{range .Events}}<li><span class="t">{{.At.Format "15:04:05"}}</span>{{.Msg}}</li>{{end}}
+      </ul>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var list = document.getElementById('events');
+  function fmtBytes(n) {
+    if (n < 1024) return n + ' B';
+    var u = ['KiB','MiB','GiB','TiB'], i = -1;
+    do { n = n / 1024; i++; } while (n >= 1024 && i < u.length - 1);
+    return n.toFixed(1) + ' ' + u[i];
+  }
+  function tick() {
+    fetch('/admin/api/status', {credentials: 'same-origin'})
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d) return;
+        if (d.events) {
+          list.textContent = '';
+          d.events.forEach(function (e) {
+            var li = document.createElement('li');
+            var t = document.createElement('span');
+            t.className = 't';
+            t.textContent = new Date(e.at).toLocaleTimeString();
+            li.appendChild(t);
+            li.appendChild(document.createTextNode(e.msg));
+            list.appendChild(li);
+          });
+        }
+        if (d.status) {
+          document.getElementById('stat-inflight').textContent = d.status.inflight;
+        }
+        if (d.downloads) {
+          document.getElementById('stat-files').textContent = d.downloads.files;
+          document.getElementById('stat-bytes').textContent = fmtBytes(d.downloads.bytes);
+        }
+      })
+      .catch(function () {});
+  }
+  setInterval(tick, 5000);
+})();
+</script>
+</body>
+</html>

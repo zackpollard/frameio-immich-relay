@@ -53,6 +53,15 @@ type Project struct {
 	RootFolderID string `json:"root_folder_id"`
 }
 
+// Webhook is a V4 workspace webhook registration. The signing secret is
+// only returned at creation time, so it never appears in list responses.
+type Webhook struct {
+	ID     string   `json:"id"`
+	Name   string   `json:"name"`
+	URL    string   `json:"url"`
+	Events []string `json:"events"`
+}
+
 // IsReady reports whether the file's bytes are actually downloadable.
 // Observed progression on X-H2S C2C uploads:
 //   - "created"    metadata row exists, bytes still uploading (S3 → 403)

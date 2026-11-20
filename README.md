@@ -163,9 +163,27 @@ All configurable via env vars (suitable for Docker Compose) or CLI flags.
 | | `-tokens` | | `tokens.json` | Path to tokens file from `frameio-auth`. |
 | | `-state` | | `relay-state.json` | Local state (webhook registration data). |
 | | `-out` | | `downloads` | Temporary local buffer for downloaded files. |
-| | `-webhook-addr` | | `:9000` | Webhook receiver bind address. |
+| | `-webhook-addr` | | `:9000` | Webhook receiver bind address. The admin panel (if enabled) is served on the same port under `/admin`. |
 | | `-poll` | | `60s` | Reconcile polling interval. |
 | | `-dry-run` | | `false` | Download but don't delete from Frame.io or upload to Immich. |
+| `ADMIN_PASSWORD` | `-admin-password` | optional | empty (disabled) | Enables the login-protected admin panel at `/admin` on the webhook port. Generate with `openssl rand -hex 24`. |
+| `ADMIN_SESSION_TTL` | `-admin-session-ttl` | | `12h` | Admin panel session lifetime. |
+
+## Admin panel
+
+Set `ADMIN_PASSWORD` and the relay serves a login-protected panel on the **same port** as the webhook, so the tunnel that exposes `/webhook` also exposes the panel:
+
+- `https://<public-host>/admin` — through your tunnel (preferred), or
+- `http://<host>:9000/admin` — on the LAN (compose binds `127.0.0.1:9000`, so the port is only reachable locally / via the tunnel).
+
+The panel shows live relay state and lets you:
+
+- **Re-authenticate with Frame.io from any browser.** Click *Re-authenticate with Frame.io…* on the dashboard: you're redirected to Adobe IMS, grant access, and Adobe redirects back to the relay, which exchanges the code and atomically rewrites `data/tokens.json` (0600) — no workstation CLI needed, no restart. Requires `FRAMEIO_PUBLIC_URL` to be set, and you must add **`https://<public-host>/admin/oauth/callback`** (default redirect URI + URI pattern) to the Adobe Developer Console project that owns the OAuth app. The client ID/secret are read from `tokens.json` (written there by `frameio-auth`); the public callback URL is never persisted.
+- See auth status (user, token expiry, refresh token presence), configuration, webhook registration (id, target, all webhooks on the workspace), download-dir usage, and a live activity feed (webhook deliveries, downloads, Immich uploads, deletions, GC) that auto-refreshes.
+- Trigger maintenance actions: run a reconcile pass now, garbage-collect stuck uploads now, re-register the webhook at the current public URL, delete the webhook (falls back to polling), reload `tokens.json` from disk, verify auth against Frame.io.
+- Inspect `/admin/state` — relay state JSON with the webhook secret masked.
+
+Security properties: the panel is fully disabled when `ADMIN_PASSWORD` is unset. Login is throttled (10 failures / 5 min per IP), the password is checked as a salted SHA-256 with a constant-time compare, sessions are random 256-bit IDs with a TTL (cookie is HttpOnly, SameSite=Lax so the OAuth redirect works, Secure over HTTPS), every state-changing POST requires a per-session CSRF token, and no secret (tokens, webhook secret, API keys) is ever rendered. `/webhook` remains HMAC-verified and independent of the panel. Keep the port bound to localhost and only expose it through your authenticated tunnel.
 
 ## Running outside Docker
 

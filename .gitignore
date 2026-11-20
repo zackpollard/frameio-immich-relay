@@ -2,6 +2,7 @@
 
 # Secrets — never commit
 .env
+docker-compose.dolores.yml
 tokens.json
 tokens.json.tmp
 data/tokens.json

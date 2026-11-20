@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} — frameio-relay admin</title>
+<style>{{template "css" .}}</style>
+</head>
+<body>
+<div class="login-box">
+  <h1>frameio-relay admin</h1>
+  <p class="sub">Sign in to manage the relay</p>
+  <form method="post" action="/admin/login">
+    <input type="hidden" name="next" value="{{.Next}}">
+    <input type="password" name="password" placeholder="Admin password" autofocus required autocomplete="current-password">
+    <button type="submit" class="primary">Sign in</button>
+  </form>
+  <div class="err-text">{{.Error}}</div>
+  <div class="hint">The panel is bound to the relay port and meant to sit behind your tunnel / on a trusted network.</div>
+</div>
+</body>
+</html>
