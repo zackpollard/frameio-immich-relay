@@ -18,6 +18,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,9 +27,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zackpollard/frameio-immich-relay/internal/admin"
 	"github.com/zackpollard/frameio-immich-relay/internal/frameio"
 	"github.com/zackpollard/frameio-immich-relay/internal/immich"
 )
+
+// version is stamped at build time via -ldflags "-X main.version=...".
+var version = "dev"
 
 func main() {
 	tokensPath := flag.String("tokens", "tokens.json", "path to tokens.json written by frameio-auth")
@@ -44,6 +49,8 @@ func main() {
 	dryRun := flag.Bool("dry-run", false, "download but do not delete from Frame.io or Immich-upload")
 	immichURL := flag.String("immich-url", os.Getenv("IMMICH_URL"), "Immich base URL, e.g. https://immich.example.com; empty disables Immich integration")
 	immichKey := flag.String("immich-key", os.Getenv("IMMICH_API_KEY"), "Immich API key (x-api-key header)")
+	adminPassword := flag.String("admin-password", os.Getenv("ADMIN_PASSWORD"), "admin panel login password; empty disables the panel at /admin on the webhook port")
+	adminSessionTTL := flag.Duration("admin-session-ttl", envDuration("ADMIN_SESSION_TTL", 12*time.Hour), "admin panel session lifetime")
 	flag.Parse()
 
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
@@ -54,8 +61,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("load tokens: %v", err)
 	}
-	if tokens.ClientID == "" || tokens.RefreshToken == "" {
-		log.Fatalf("tokens file %s is incomplete — run frameio-auth first", *tokensPath)
+	// Client credentials may come from the environment instead of tokens.json
+	// — that is how a fresh host bootstraps through the /admin panel.
+	if tokens.ClientID == "" {
+		tokens.ClientID = os.Getenv("FRAMEIO_CLIENT_ID")
+	}
+	if tokens.ClientSecret == "" {
+		tokens.ClientSecret = os.Getenv("FRAMEIO_CLIENT_SECRET")
+	}
+	bootstrapping := tokens.RefreshToken == ""
+	if bootstrapping && *adminPassword == "" {
+		log.Fatalf("tokens file %s has no refresh token — run frameio-auth first, or set ADMIN_PASSWORD (+ FRAMEIO_CLIENT_ID/FRAMEIO_CLIENT_SECRET) to bootstrap via the /admin panel", *tokensPath)
 	}
 	client := frameio.NewClient(tokens, *accountID)
 
@@ -66,23 +82,6 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-
-	name, err := client.Me(ctx)
-	if err != nil {
-		log.Fatalf("auth check: %v", err)
-	}
-	log.Printf("authenticated as %s", name)
-
-	if err := autoDiscover(ctx, client, accountID, workspaceID, folderID); err != nil {
-		log.Fatalf("auto-discover: %v", err)
-	}
-	if *accountID == "" {
-		log.Fatal("FRAMEIO_ACCOUNT required (discovery did not find one)")
-	}
-	if *folderID == "" {
-		log.Fatal("FRAMEIO_FOLDER required (discovery did not find one)")
-	}
-	client.AccountID = *accountID
 
 	var imm *immich.Client
 	if *immichURL != "" {
@@ -96,57 +95,63 @@ func main() {
 	}
 
 	r := &relay{
-		client:       client,
-		immich:       imm,
-		folderID:     *folderID,
-		outDir:       *outDir,
-		stateFile:    *stateFile,
-		state:        st,
-		dryRun:       *dryRun,
-		stuckTimeout: *stuckTimeout,
-		inflight:     map[string]struct{}{},
+		client:        client,
+		tokens:        tokens,
+		immich:        imm,
+		folderID:      *folderID,
+		outDir:        *outDir,
+		stateFile:     *stateFile,
+		state:         st,
+		dryRun:        *dryRun,
+		stuckTimeout:  *stuckTimeout,
+		publicURL:     *publicURL,
+		pollInterval:  *pollInterval,
+		account:       *accountID,
+		workspace:     *workspaceID,
+		immichURL:     *immichURL,
+		startedAt:     time.Now(),
+		inflight:      map[string]struct{}{},
+		whSecret:      st.WebhookSecret,
+		events:        newEventLog(200),
+		sigCtx:        ctx,
+		accountFlag:   accountID,
+		workspaceFlag: workspaceID,
+		folderFlag:    folderID,
 	}
 
-	// Register webhook if we have a public URL and don't already have one.
-	if *publicURL != "" {
-		if *workspaceID == "" {
-			log.Fatalf("-workspace is required when -public-url is set (webhooks are workspace-scoped)")
-		}
-		if st.WebhookID == "" {
-			secret, id, err := client.RegisterWebhook(ctx, *workspaceID, *publicURL, []string{"file.upload.completed"})
-			if err != nil {
-				log.Fatalf("register webhook: %v", err)
-			}
-			st.WebhookID = id
-			st.WebhookSecret = secret
-			st.WebhookWorkspace = *workspaceID
-			if err := saveState(*stateFile, st); err != nil {
-				log.Fatalf("save state after webhook register: %v", err)
-			}
-			log.Printf("registered webhook %s → %s", id, *publicURL)
-		} else {
-			log.Printf("reusing existing webhook %s (secret cached in state)", st.WebhookID)
-		}
+	if bootstrapping {
+		log.Printf("no refresh token in %s — bootstrap mode: serving the admin panel only; finish the Frame.io login at /admin to go live", *tokensPath)
+		r.eventf("bootstrap mode: no refresh token in %s; complete the browser login in the admin panel to go live", *tokensPath)
 	} else {
-		log.Printf("no -public-url set — running in polling-only mode")
+		if err := r.goLive(ctx); err != nil {
+			log.Fatalf("startup: %v", err)
+		}
 	}
 
-	// HTTP server for webhook deliveries.
-	if st.WebhookSecret != "" {
-		go r.runWebhookServer(ctx, *webhookAddr, st.WebhookSecret)
+	// HTTP server on the webhook port: /webhook for Frame.io deliveries,
+	// /admin for the optional login-protected admin panel (same tunnel).
+	var adm *admin.Server
+	if *adminPassword != "" {
+		origin := publicOrigin(*publicURL)
+		a, err := admin.New(admin.Config{
+			Password:     *adminPassword,
+			SessionTTL:   *adminSessionTTL,
+			PublicOrigin: origin,
+			Version:      version,
+		}, &relayBackend{r: r, st: st})
+		if err != nil {
+			log.Fatalf("admin panel: %v", err)
+		}
+		adm = a
+		if origin != "" {
+			r.eventf("admin panel enabled at %s/admin (login required)", origin)
+		} else {
+			r.eventf("admin panel enabled on %s (login required; browser re-auth needs FRAMEIO_PUBLIC_URL)", *webhookAddr)
+		}
 	}
+	go r.runHTTPServer(ctx, *webhookAddr, adm)
 
-	// Startup sweep of any local files (orphans from a crashed Immich
-	// upload, or from before Immich was enabled). No-op when Immich is
-	// disabled. Must run before the poll loop so uploads don't race with
-	// Frame.io-initiated processing of the same file.
-	if err := r.reconcileLocal(ctx); err != nil {
-		log.Printf("local reconcile: %v", err)
-	}
-
-	// Reconcile polling loop — catches anything missed by the webhook path.
-	r.runPollLoop(ctx, *pollInterval)
-
+	<-ctx.Done()
 	log.Printf("shutting down")
 }
 
@@ -247,6 +252,7 @@ func saveState(path string, s *state) error {
 
 type relay struct {
 	client       *frameio.Client
+	tokens       *frameio.TokenStore
 	immich       *immich.Client // nil => skip Immich integration
 	folderID     string
 	outDir       string
@@ -254,9 +260,33 @@ type relay struct {
 	state        *state
 	dryRun       bool
 	stuckTimeout time.Duration // 0 = never clean up stuck uploads
+	publicURL    string
+	pollInterval time.Duration
+	account      string
+	workspace    string
+	immichURL    string
+	authName     string
+	startedAt    time.Time
 
 	mu       sync.Mutex
 	inflight map[string]struct{} // asset IDs currently being processed
+
+	stateMu sync.Mutex // guards state + its file writes (admin actions mutate it)
+
+	whMu     sync.RWMutex
+	whSecret string // live webhook signing secret (admin can re-register)
+
+	events *eventLog // ring buffer shown on the admin dashboard
+
+	// Bootstrap mode support: when tokens.json has no refresh token yet,
+	// the relay serves only the admin panel and calls goLive after the
+	// browser OAuth flow saves tokens.
+	sigCtx        context.Context
+	accountFlag   *string
+	workspaceFlag *string
+	folderFlag    *string
+	liveMu        sync.Mutex
+	live          bool
 }
 
 func (r *relay) runPollLoop(ctx context.Context, interval time.Duration) {
@@ -370,12 +400,12 @@ func (r *relay) reconcile(ctx context.Context) error {
 	for _, f := range files {
 		if f.IsReady() {
 			if err := r.process(ctx, f); err != nil {
-				log.Printf("[%s] reconcile process: %v", f.ID, err)
+				r.eventf("[%s] reconcile process: %v", f.ID, err)
 			}
 			continue
 		}
 		if err := r.maybeReapStuck(ctx, f); err != nil {
-			log.Printf("[%s] reap stuck: %v", f.ID, err)
+			r.eventf("[%s] reap stuck: %v", f.ID, err)
 		}
 	}
 	return nil
@@ -401,7 +431,7 @@ func (r *relay) maybeReapStuck(ctx context.Context, f frameio.File) error {
 	}
 	defer r.release(f.ID)
 
-	log.Printf("[%s] %s stuck in status=%q for %s (> %s); deleting", f.ID, f.Name, f.Status, age.Round(time.Second), r.stuckTimeout)
+	r.eventf("[%s] %s stuck in status=%q for %s (> %s); deleting", f.ID, f.Name, f.Status, age.Round(time.Second), r.stuckTimeout)
 	return r.client.DeleteFile(ctx, f.ID)
 }
 
@@ -461,12 +491,12 @@ func (r *relay) process(ctx context.Context, f frameio.File) error {
 	// Handles the crash-between-download-and-delete recovery case.
 	skipDownload := false
 	if info, err := os.Stat(dst); err == nil && info.Size() == f.FileSize && f.FileSize > 0 {
-		log.Printf("[%s] %s — local copy exists (%d bytes); skipping download", f.ID, f.Name, f.FileSize)
+		r.eventf("[%s] %s — local copy exists (%d bytes); skipping download", f.ID, f.Name, f.FileSize)
 		skipDownload = true
 	}
 
 	if !skipDownload {
-		log.Printf("[%s] %s (%s, %d bytes) → %s", f.ID, f.Name, f.MediaType, f.FileSize, dst)
+		r.eventf("[%s] %s (%s, %d bytes) → %s", f.ID, f.Name, f.MediaType, f.FileSize, dst)
 		body, _, err := r.client.Download(ctx, f)
 		if err != nil {
 			return fmt.Errorf("download: %w", err)
@@ -485,7 +515,7 @@ func (r *relay) process(ctx context.Context, f frameio.File) error {
 	}
 
 	if r.dryRun {
-		log.Printf("[%s] dry-run: skipping Immich upload + Frame.io delete", f.ID)
+		r.eventf("[%s] dry-run: skipping Immich upload + Frame.io delete", f.ID)
 		return nil
 	}
 
@@ -497,20 +527,20 @@ func (r *relay) process(ctx context.Context, f frameio.File) error {
 			return fmt.Errorf("immich: %w", err)
 		}
 		if uploaded {
-			log.Printf("[%s] immich uploaded: %s", f.ID, assetID)
+			r.eventf("[%s] immich uploaded: %s", f.ID, assetID)
 		} else {
-			log.Printf("[%s] immich already had it: %s", f.ID, assetID)
+			r.eventf("[%s] immich already had it: %s", f.ID, assetID)
 		}
 		// Immich has it. Local copy is now redundant.
 		if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-			log.Printf("[%s] warning: remove local copy: %v", f.ID, err)
+			r.eventf("[%s] warning: remove local copy: %v", f.ID, err)
 		}
 	}
 
 	if err := r.client.DeleteFile(ctx, f.ID); err != nil {
 		return fmt.Errorf("delete: %w", err)
 	}
-	log.Printf("[%s] deleted from frame.io", f.ID)
+	r.eventf("[%s] deleted from frame.io", f.ID)
 	return nil
 }
 
@@ -527,56 +557,24 @@ func (r *relay) localPath(f frameio.File) (dst, tmp string) {
 	return dst, dst + ".part"
 }
 
-// Webhook server -----------------------------------------------------------
+// Webhook + admin HTTP server ----------------------------------------------
+//
+// One port serves both: /webhook for Frame.io deliveries (HMAC-verified,
+// no session) and /admin for the login-protected panel, so a single tunnel
+// in front of the port exposes both.
 
-func (r *relay) runWebhookServer(ctx context.Context, addr, secret string) {
+func (r *relay) runHTTPServer(ctx context.Context, addr string, adm *admin.Server) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/webhook", func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != "POST" {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		body, err := frameio.ReadWebhookBody(req, 1<<20)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		sig := req.Header.Get(frameio.WebhookSignatureHeader)
-		ts := req.Header.Get(frameio.WebhookTimestampHeader)
-		if err := frameio.WebhookVerify(secret, sig, ts, body, 5*time.Minute); err != nil {
-			log.Printf("webhook: verify failed: %v", err)
-			http.Error(w, "bad signature", http.StatusUnauthorized)
-			return
-		}
-		var evt frameio.WebhookEvent
-		if err := json.Unmarshal(body, &evt); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		log.Printf("webhook: %s resource=%s/%s", evt.Type, evt.Resource.Type, evt.Resource.ID)
-
-		// Respond immediately so Frame.io doesn't retry; handle the event async.
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ok")
-
-		if evt.Type == "file.upload.completed" && evt.Resource.Type == "file" && evt.Resource.ID != "" {
-			// process() handles dedup via inflight; no persistent check needed.
-			go func(id string) {
-				bg, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-				defer cancel()
-				f, err := r.client.GetFile(bg, id)
-				if err != nil {
-					log.Printf("webhook process: get %s: %v", id, err)
-					return
-				}
-				if err := r.process(bg, f); err != nil {
-					log.Printf("webhook process: %s: %v", id, err)
-				}
-			}(evt.Resource.ID)
-		}
-	})
+	mux.HandleFunc("/webhook", r.handleWebhook)
+	if adm != nil {
+		mux.Handle("/", adm.Handler()) // inner mux owns the /admin... patterns
+	}
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	log.Printf("webhook server listening on %s (path /webhook)", addr)
+	if adm != nil {
+		r.eventf("HTTP server listening on %s (webhook /webhook, admin /admin)", addr)
+	} else {
+		r.eventf("webhook server listening on %s (path /webhook)", addr)
+	}
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -584,7 +582,57 @@ func (r *relay) runWebhookServer(ctx context.Context, addr, secret string) {
 		_ = srv.Shutdown(shutCtx)
 	}()
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Printf("webhook server: %v", err)
+		log.Printf("http server: %v", err)
+	}
+}
+
+func (r *relay) handleWebhook(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	secret := r.currentSecret()
+	if secret == "" {
+		http.Error(w, "webhook not registered", http.StatusServiceUnavailable)
+		return
+	}
+	body, err := frameio.ReadWebhookBody(req, 1<<20)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	sig := req.Header.Get(frameio.WebhookSignatureHeader)
+	ts := req.Header.Get(frameio.WebhookTimestampHeader)
+	if err := frameio.WebhookVerify(secret, sig, ts, body, 5*time.Minute); err != nil {
+		r.eventf("webhook: verify failed: %v", err)
+		http.Error(w, "bad signature", http.StatusUnauthorized)
+		return
+	}
+	var evt frameio.WebhookEvent
+	if err := json.Unmarshal(body, &evt); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	r.eventf("webhook: %s resource=%s/%s", evt.Type, evt.Resource.Type, evt.Resource.ID)
+
+	// Respond immediately so Frame.io doesn't retry; handle the event async.
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "ok")
+
+	if evt.Type == "file.upload.completed" && evt.Resource.Type == "file" && evt.Resource.ID != "" {
+		// process() handles dedup via inflight; no persistent check needed.
+		go func(id string) {
+			bg, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			f, err := r.client.GetFile(bg, id)
+			if err != nil {
+				r.eventf("webhook process: get %s: %v", id, err)
+				return
+			}
+			if err := r.process(bg, f); err != nil {
+				r.eventf("webhook process: %s: %v", id, err)
+			}
+		}(evt.Resource.ID)
 	}
 }
 
@@ -617,4 +665,392 @@ func writeAndClose(path string, body io.ReadCloser) (int64, error) {
 		return n, copyErr
 	}
 	return n, closeErr
+}
+
+// Event log (admin dashboard ring buffer) -----------------------------------
+
+type eventLog struct {
+	mu  sync.Mutex
+	buf []admin.Event
+	max int
+}
+
+func newEventLog(max int) *eventLog { return &eventLog{max: max} }
+
+func (e *eventLog) add(msg string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.buf = append(e.buf, admin.Event{At: time.Now(), Msg: msg})
+	if len(e.buf) > e.max {
+		e.buf = e.buf[len(e.buf)-e.max:]
+	}
+}
+
+// recent returns up to n newest events, newest first.
+func (e *eventLog) recent(n int) []admin.Event {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if n > len(e.buf) {
+		n = len(e.buf)
+	}
+	out := make([]admin.Event, n)
+	copy(out, e.buf[len(e.buf)-n:])
+	for i, j := 0, n-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+// eventf logs a line and records it for the admin dashboard.
+func (r *relay) eventf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	log.Print(msg)
+	r.events.add(msg)
+}
+
+// goLive runs the authenticated startup sequence: verify auth, auto-discover
+// account/workspace/folder, register the webhook, sweep local files, and
+// start the poll loop. Called once from main on a normal start, or once from
+// the admin OAuth callback in bootstrap mode. On failure in bootstrap mode
+// the live flag is reset so a later re-auth can retry.
+func (r *relay) goLive(ctx context.Context) error {
+	r.liveMu.Lock()
+	if r.live {
+		r.liveMu.Unlock()
+		return nil
+	}
+	r.live = true
+	r.liveMu.Unlock()
+	fail := func(err error) error {
+		r.liveMu.Lock()
+		r.live = false
+		r.liveMu.Unlock()
+		return err
+	}
+
+	name, err := r.client.Me(ctx)
+	if err != nil {
+		return fail(fmt.Errorf("auth check: %w", err))
+	}
+	r.authName = name
+	r.eventf("authenticated as %s", name)
+
+	if err := autoDiscover(ctx, r.client, r.accountFlag, r.workspaceFlag, r.folderFlag); err != nil {
+		return fail(fmt.Errorf("auto-discover: %w", err))
+	}
+	if *r.accountFlag == "" {
+		return fail(errors.New("FRAMEIO_ACCOUNT required (discovery did not find one)"))
+	}
+	if *r.folderFlag == "" {
+		return fail(errors.New("FRAMEIO_FOLDER required (discovery did not find one)"))
+	}
+	r.client.AccountID = *r.accountFlag
+	r.account = *r.accountFlag
+	r.workspace = *r.workspaceFlag
+	r.folderID = *r.folderFlag
+
+	if err := r.ensureWebhook(ctx); err != nil {
+		return fail(err)
+	}
+
+	// Startup sweep of local files, then the reconcile poll loop (both in
+	// the background — main blocks on the signal context).
+	if err := r.reconcileLocal(ctx); err != nil {
+		r.eventf("local reconcile: %v", err)
+	}
+	go r.runPollLoop(r.sigCtx, r.pollInterval)
+	r.eventf("relay live: polling every %s, folder %s", r.pollInterval, r.folderID)
+	return nil
+}
+
+// ensureWebhook registers the Frame.io webhook if a public URL is configured
+// and no webhook is registered yet; otherwise reuses the cached one.
+func (r *relay) ensureWebhook(ctx context.Context) error {
+	if r.publicURL == "" {
+		r.eventf("no -public-url set — running in polling-only mode")
+		return nil
+	}
+	if r.workspace == "" {
+		return errors.New("FRAMEIO_WORKSPACE required when FRAMEIO_PUBLIC_URL is set (webhooks are workspace-scoped)")
+	}
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	if r.state.WebhookID != "" {
+		r.eventf("reusing existing webhook %s (secret cached in state)", r.state.WebhookID)
+		return nil
+	}
+	secret, id, err := r.client.RegisterWebhook(ctx, r.workspace, r.publicURL, []string{"file.upload.completed"})
+	if err != nil {
+		return fmt.Errorf("register webhook: %w", err)
+	}
+	r.state.WebhookID = id
+	r.state.WebhookSecret = secret
+	r.state.WebhookWorkspace = r.workspace
+	if err := saveState(r.stateFile, r.state); err != nil {
+		return fmt.Errorf("save state after webhook register: %w", err)
+	}
+	r.setSecret(secret)
+	r.eventf("registered webhook %s → %s", id, r.publicURL)
+	return nil
+}
+
+// Admin backend ---------------------------------------------------------------
+
+func (r *relay) inflightCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.inflight)
+}
+
+func (r *relay) setSecret(s string) {
+	r.whMu.Lock()
+	r.whSecret = s
+	r.whMu.Unlock()
+}
+
+func (r *relay) currentSecret() string {
+	r.whMu.RLock()
+	defer r.whMu.RUnlock()
+	return r.whSecret
+}
+
+// downloadStats counts files + bytes currently under the download dir.
+func (r *relay) downloadStats() (files int, bytes int64) {
+	_ = filepath.WalkDir(r.outDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			files++
+			bytes += info.Size()
+		}
+		return nil
+	})
+	return files, bytes
+}
+
+// publicOrigin extracts scheme://host from the webhook public URL ("" if unset
+// or unparseable). The admin panel lives at <origin>/admin and the browser
+// OAuth callback at <origin>/admin/oauth/callback.
+func publicOrigin(publicURL string) string {
+	if publicURL == "" {
+		return ""
+	}
+	u, err := url.Parse(publicURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// relayBackend implements admin.Backend for the relay.
+type relayBackend struct {
+	r  *relay
+	st *state
+}
+
+func (b *relayBackend) Status() admin.Status {
+	r := b.r
+	r.stateMu.Lock()
+	whID := b.st.WebhookID
+	r.stateMu.Unlock()
+	origin := publicOrigin(r.publicURL)
+	adminURL := ""
+	if origin != "" {
+		adminURL = origin + "/admin"
+	}
+	cID, cSecret := r.tokens.Credentials()
+	credsOK := cID != "" && cSecret != ""
+	return admin.Status{
+		Version:        version,
+		StartedAt:      r.startedAt,
+		Uptime:         time.Since(r.startedAt).Round(time.Second).String(),
+		Account:        r.account,
+		Workspace:      r.workspace,
+		Folder:         r.folderID,
+		PublicURL:      r.publicURL,
+		AdminURL:       adminURL,
+		PollingOnly:    r.publicURL == "",
+		ImmichURL:      r.immichURL,
+		PollInterval:   r.pollInterval,
+		StuckTimeout:   r.stuckTimeout,
+		DryRun:         r.dryRun,
+		Inflight:       r.inflightCount(),
+		WebhookID:      whID,
+		WebhookTarget:  r.publicURL,
+		TokensPath:     r.tokens.Path,
+		StateFile:      r.stateFile,
+		OutDir:         r.outDir,
+		AuthName:       r.authName,
+		TokenExpiry:    r.tokens.Expiry(),
+		HasRefresh:     r.tokens.HasRefreshToken(),
+		AdminEnabled:   true,
+		OAuthAvailable: origin != "" && credsOK,
+	}
+}
+
+func (b *relayBackend) Events(n int) []admin.Event { return b.r.events.recent(n) }
+
+func (b *relayBackend) AuthCheck(ctx context.Context) (string, error) {
+	name, err := b.r.client.Me(ctx)
+	if err != nil {
+		return "", err
+	}
+	b.r.authName = name
+	return name, nil
+}
+
+func (b *relayBackend) ReconcileNow() {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		if err := b.r.reconcile(ctx); err != nil {
+			b.r.eventf("manual reconcile: %v", err)
+		} else {
+			b.r.eventf("manual reconcile: done")
+		}
+	}()
+}
+
+func (b *relayBackend) ReapStuckNow() {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		files, err := b.r.walk(ctx, b.r.folderID)
+		if err != nil {
+			b.r.eventf("manual GC: walk: %v", err)
+			return
+		}
+		n := 0
+		for _, f := range files {
+			if f.IsReady() {
+				continue
+			}
+			if err := b.r.maybeReapStuck(ctx, f); err != nil {
+				b.r.eventf("manual GC: [%s]: %v", f.ID, err)
+			} else {
+				n++
+			}
+		}
+		b.r.eventf("manual GC: scanned %d non-ready file(s)", n)
+	}()
+}
+
+func (b *relayBackend) RegisterWebhook(ctx context.Context) (string, error) {
+	r := b.r
+	if r.publicURL == "" {
+		return "", errors.New("no FRAMEIO_PUBLIC_URL configured")
+	}
+	if r.workspace == "" {
+		return "", errors.New("no FRAMEIO_WORKSPACE configured")
+	}
+	secret, id, err := r.client.RegisterWebhook(ctx, r.workspace, r.publicURL, []string{"file.upload.completed"})
+	if err != nil {
+		return "", err
+	}
+	r.stateMu.Lock()
+	old := b.st.WebhookID
+	b.st.WebhookID = id
+	b.st.WebhookSecret = secret
+	b.st.WebhookWorkspace = r.workspace
+	saveErr := saveState(r.stateFile, b.st)
+	r.stateMu.Unlock()
+	if saveErr != nil {
+		return "", saveErr
+	}
+	r.setSecret(secret)
+	if old != "" && old != id {
+		if derr := r.client.DeleteWebhook(ctx, old); derr != nil {
+			r.eventf("old webhook %s delete failed (delete it manually): %v", old, derr)
+		}
+	}
+	r.eventf("webhook registered %s → %s", id, r.publicURL)
+	return id, nil
+}
+
+func (b *relayBackend) DeleteWebhook(ctx context.Context) error {
+	r := b.r
+	r.stateMu.Lock()
+	id := b.st.WebhookID
+	if id == "" {
+		r.stateMu.Unlock()
+		return nil
+	}
+	b.st.WebhookID = ""
+	b.st.WebhookSecret = ""
+	b.st.WebhookWorkspace = ""
+	saveErr := saveState(r.stateFile, b.st)
+	r.stateMu.Unlock()
+	if saveErr != nil {
+		return saveErr
+	}
+	r.setSecret("")
+	if err := r.client.DeleteWebhook(ctx, id); err != nil {
+		return err
+	}
+	r.eventf("webhook %s deleted; polling-only mode", id)
+	return nil
+}
+
+func (b *relayBackend) ListWebhooks(ctx context.Context) ([]frameio.Webhook, error) {
+	ws := b.r.workspace
+	b.r.stateMu.Lock()
+	if b.st.WebhookWorkspace != "" {
+		ws = b.st.WebhookWorkspace
+	}
+	b.r.stateMu.Unlock()
+	if ws == "" {
+		return nil, errors.New("no workspace configured")
+	}
+	return b.r.client.ListWebhooks(ctx, ws)
+}
+
+func (b *relayBackend) ReloadTokens() error {
+	return b.r.tokens.Reload()
+}
+
+func (b *relayBackend) ClientCredentials() (string, string, bool) {
+	id, secret := b.r.tokens.Credentials()
+	return id, secret, id != "" && secret != ""
+}
+
+// ExchangeOAuthCode runs the authorization-code exchange on a path-less
+// throwaway TokenStore (so the public callback URL is never persisted as
+// redirect_uri), then adopts the resulting tokens into the live store.
+func (b *relayBackend) ExchangeOAuthCode(ctx context.Context, code, redirectURI string) error {
+	r := b.r
+	id, secret := r.tokens.Credentials()
+	if id == "" || secret == "" {
+		return errors.New("no Adobe client credentials in tokens.json")
+	}
+	tmp := &frameio.TokenStore{ClientID: id, ClientSecret: secret, RedirectURI: redirectURI}
+	if err := tmp.ExchangeCode(ctx, code); err != nil {
+		return err
+	}
+	if err := r.tokens.Adopt(tmp); err != nil {
+		return err
+	}
+	r.eventf("browser OAuth exchange complete; tokens saved to %s", r.tokens.Path)
+	// In bootstrap mode (no tokens at startup) this is the moment the relay
+	// goes live: auth check, discovery, webhook registration, poll loop.
+	liveCtx, cancel := context.WithTimeout(r.sigCtx, 2*time.Minute)
+	defer cancel()
+	if err := r.goLive(liveCtx); err != nil {
+		r.eventf("go-live after browser auth failed: %v — fix the config and re-run Re-authenticate", err)
+	}
+	return nil
+}
+
+func (b *relayBackend) DownloadStats() (int, int64) { return b.r.downloadStats() }
+
+// StateView returns the relay state with the webhook secret masked out.
+func (b *relayBackend) StateView() map[string]any {
+	b.r.stateMu.Lock()
+	defer b.r.stateMu.Unlock()
+	return map[string]any{
+		"webhook_id":         b.st.WebhookID,
+		"webhook_workspace":  b.st.WebhookWorkspace,
+		"webhook_secret_set": b.st.WebhookSecret != "",
+		"state_file":         b.r.stateFile,
+	}
 }

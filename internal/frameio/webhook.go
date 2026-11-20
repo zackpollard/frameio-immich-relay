@@ -98,6 +98,18 @@ func (c *Client) RegisterWebhook(ctx context.Context, workspaceID, publicURL str
 	return wrap.Data.Secret, wrap.Data.ID, nil
 }
 
+// ListWebhooks returns every webhook registered on a workspace. The signing
+// secrets are not included in list responses.
+func (c *Client) ListWebhooks(ctx context.Context, workspaceID string) ([]Webhook, error) {
+	var wrap struct {
+		Data []Webhook `json:"data"`
+	}
+	if _, err := c.do(ctx, "GET", c.accountPath("/workspaces/"+workspaceID+"/webhooks"), nil, nil, &wrap); err != nil {
+		return nil, err
+	}
+	return wrap.Data, nil
+}
+
 // DeleteWebhook removes a previously-created webhook. V4 quirk: create
 // is scoped to a workspace, but delete is scoped only to the account
 // (webhook_id alone identifies it).

@@ -186,7 +186,76 @@ func (s *TokenStore) tokenRequest(ctx context.Context, form url.Values) error {
 	if tr.Scope != "" {
 		s.Scope = tr.Scope
 	}
-	err = s.saveLocked()
+	// Path-less stores (e.g. the admin panel's throwaway exchange store)
+	// are kept in memory only.
+	if s.Path != "" {
+		err = s.saveLocked()
+	}
 	s.mu.Unlock()
 	return err
+}
+
+// Adopt replaces the in-memory token fields with those from o and persists
+// them. Used by the admin panel's browser OAuth flow: the code exchange runs
+// on a path-less throwaway store (so the public callback URL is never
+// written to disk as redirect_uri), then the resulting tokens are adopted
+// into the real store here.
+func (s *TokenStore) Adopt(o *TokenStore) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Access = o.Access
+	s.RefreshToken = o.RefreshToken
+	s.ExpiresAt = o.ExpiresAt
+	s.Scope = o.Scope
+	return s.saveLocked()
+}
+
+// Reload re-reads the store from its Path, replacing all in-memory fields.
+// Used by the admin panel's "reload tokens from disk" action after the file
+// was replaced externally.
+func (s *TokenStore) Reload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Path == "" {
+		return errors.New("tokens: no path set")
+	}
+	b, err := os.ReadFile(s.Path)
+	if err != nil {
+		return err
+	}
+	var n TokenStore
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	s.ClientID = n.ClientID
+	s.ClientSecret = n.ClientSecret
+	s.RedirectURI = n.RedirectURI
+	s.Access = n.Access
+	s.RefreshToken = n.RefreshToken
+	s.ExpiresAt = n.ExpiresAt
+	s.Scope = n.Scope
+	return nil
+}
+
+// Credentials returns the OAuth client ID and secret. Both are needed by
+// the admin panel's browser re-auth flow (the secret is only used
+// server-side at the token exchange step; it is never rendered).
+func (s *TokenStore) Credentials() (id, secret string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ClientID, s.ClientSecret
+}
+
+// Expiry returns when the current access token expires.
+func (s *TokenStore) Expiry() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ExpiresAt
+}
+
+// HasRefreshToken reports whether a refresh token is stored.
+func (s *TokenStore) HasRefreshToken() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.RefreshToken != ""
 }
